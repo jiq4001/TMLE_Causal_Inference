@@ -1,0 +1,881 @@
+---
+title: "TMLE Data Summary and Wragling"
+author: "Jingjing Qi"
+date: "April 6, 2020; updated `r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{css, echo=F}
+.scroll {
+  max-height: 300px;
+  overflow-y: auto;
+}
+```
+
+```{r, echo=FALSE}
+my_plot_theme <- function () {
+  theme_classic() %+replace% 
+        theme(panel.border = element_blank(), panel.grid.major = element_blank(), 
+              plot.title = element_text(face = "bold", hjust = 0.5, size = 14),
+              legend.position = "bottom",
+              panel.grid.minor = element_blank(), 
+              axis.line = element_line(colour = "black", size = rel(1)), legend.key = element_blank(), 
+              strip.background = element_rect(fill = "white", colour = "black", size = rel(2)), 
+              complete = TRUE)
+  }
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(magrittr)
+library(janitor)
+library(mice)
+library(survival)
+library(survminer)
+```
+
+
+```{r, class.output="scroll", message=F, warning=F, echo=F}
+########
+# med
+########
+med1 <- readxl::read_xlsx("../inst/data/BaselineHM3Labs.discharge.xlsx", 
+                             sheet = 1) %>% 
+  clean_names() %>% 
+  filter(!is.na(id)) %>%
+  dplyr::mutate(visit_date = as.Date(visit_date))
+```
+
+```{r, class.output="scroll", message=F, warning=F, echo=F}
+########
+# outcome and baseline var
+########
+add_1 <- readxl::read_xlsx("../inst/data/BaselineHM3Labs.discharge.xlsx", 
+                             sheet = 2) %>% 
+  clean_names() %>% 
+  filter(!is.na(id)) %>%
+  dplyr::mutate(discharge_date = as.Date(discharge_date))
+
+ques1 <- readxl::read_xlsx("../inst/data/medication spreadsheet 3.14 HM3 only deidentified.xlsx", 
+                             sheet = 2) %>% 
+  clean_names() %>%
+  dplyr::mutate(admitted = as.Date(admitted),
+         implant_date = as.Date(implant_date),
+         discharge_date = as.Date(discharge_date),
+         mcs_start_date = as.Date(as.numeric(mcs_start_date), origin = "1899-12-30"),
+         x1st_device_exchange_date = as.Date(as.numeric(x1st_device_exchange_date), origin = "1899-12-30"),
+         outcome_date = as.Date(outcome_date),
+         gib_date = as.Date(as.numeric(gib_date), origin = "1899-12-30")) %>%
+         dplyr::mutate_if(is.character, tolower) %>%
+         dplyr::mutate(race = case_when(hispanic_yes_no == "yes" ~ "hisp",
+                                race_afroamerican == "yes" ~ "afam",
+                                race_white == "yes" ~ "white",
+                                race_asian == "yes" ~ "asian",
+                                TRUE ~ "others")) %>%
+  merge.data.frame(add_1, by = c("id", "discharge_date"))
+
+ques1$idx <- 1: nrow(ques1) # simple index
+```
+
+```{r, class.output="scroll", message=F, warning=F, echo=F}
+########
+# lab  type_mcs_support_1
+########
+lab1 <- readxl::read_xlsx("../inst/data/BaselineHM3Labs.discharge.xlsx", 
+                             sheet = 3) %>% 
+  clean_names() %>%
+  select(-visit_n, -visit_date_meds, -comments) %>%  # only keep lab data for relationship table
+  filter(!is.na(ideal_date_labs)) %>%
+  dplyr::mutate(ideal_date_labs = as.Date(as.numeric(ideal_date_labs), origin = "1899-12-30"),
+         id = factor(id)) %>%
+  dplyr::mutate_if(is.character, as.numeric) 
+```
+
+```{r, echo=F}
+unit = 30 #days/  date to month
+int_tp = 3#month/ between nodes
+max_censor <- 18 #/months use large number for admistritive sencoring or desired max time frame   (max gib/death happened at 25month)
+```
+
+
+```{r, class.output="scroll", message=F, warning=F, echo=F, fig.align="center"}
+#unique(ques1$final_outcome_reason)
+ques1 %>%
+  select(id, idx, discharge_date, outcome_date, final_outcome_reason, ever_gib_yes_1_no_0, gib_date) %>%
+  dplyr::mutate(month_to_outcome = ceiling(as.numeric(difftime(outcome_date, discharge_date)/unit)),
+         max_censor = min(max_censor, max(month_to_outcome)),
+         month_to_death = ifelse(final_outcome_reason == "expired", month_to_outcome, NA),
+         #DorC = ifelse(final_outcome_reason == "expired" | month_to_outcome >= max_censor, 1, 0),
+         month_to_censored_d = ifelse(!is.na(month_to_death) & (month_to_outcome < max_censor), NA, pmin(max_censor, month_to_outcome)),
+         month_to_gib = ceiling(as.numeric(difftime(gib_date, discharge_date)/unit)),
+         month_to_gib_or_death = ifelse(final_outcome_reason == "expired" | (ever_gib_yes_1_no_0 == 1) , pmin(month_to_outcome, month_to_gib, na.rm = T), NA),
+         # excluede before discharge event
+         #month_to_gib_or_death = ifelse(month_to_gib_or_death <= 0, NA, month_to_gib_or_death), 06012020 fix
+         month_to_gib_or_death = ifelse(month_to_gib_or_death <= 0 | month_to_gib_or_death > max_censor, NA, month_to_gib_or_death),
+         #DorBorC = ifelse(gib_or_death ==1 | (!is.na(month_to_gib) & month_to_gib >= max_censor), 1, 0),
+         month_to_DorB_censored = ifelse(!is.na(month_to_gib_or_death) & (month_to_gib_or_death < max_censor), NA, pmin(max_censor, month_to_outcome))) -> ques2
+
+event2nd <- 
+  ques2%>%
+  select(id, idx, month_to_DorB_censored, month_to_gib_or_death)%>%
+  mutate(nodes = pmin(month_to_DorB_censored, month_to_gib_or_death, na.rm = T),
+         nodes = abs(ceiling( nodes/int_tp)))%>%
+  mutate(month_to_DorB_censored = abs(month_to_DorB_censored),
+         month_to_gib_or_death = abs(month_to_gib_or_death)) %>% #### temporary fix #####
+  filter(nodes > 0)
+
+
+timeframe <- expand.grid(idx = event2nd$idx, 
+                        nodes = 1:((ques2$max_censor)/int_tp)) %>% 
+ merge.data.frame(event2nd, all.x = T)%>%
+ mutate(event = month_to_gib_or_death,
+        censor = month_to_DorB_censored)%>%
+ group_by(idx)%>%
+ arrange(idx, nodes)%>%
+ fill(event, censor, .direction = "down")%>%
+ mutate(event = ifelse(!is.na(event), 1, 0),
+        censor = ifelse(!is.na(censor) & event == 0, 1, 0 ))
+
+```
+
+
+```{r, class.output="scroll", message=F, warning=F, echo=F, results="hide"}
+
+W <- ques1[, c(4:7, 9, 10, 11:19, 25, 31:34, 38:46, 50:57)] %>% 
+  mutate_if(is.character, as.factor)
+
+W %>%
+  mutate(sex_m_male = factor(ifelse(sex_m_male %in% c("f", "female"), "f", "m")),
+         strategy = factor(ifelse(strategy != "dt", "other", "dt")),
+         race = factor(ifelse(race != "afam", "other", "afam")))%>%
+  select(-implant_date, -device_type, -dialysis_pre_vad_1_yes_0_no,  -x1st_device_exchange) -> W  ### needs to decide Var with multi categories
+W <- complete(mice(W, seed = 11))
+W$albumin_g_d_l  <- as.numeric(W$albumin_g_d_l)
+W$tbili  <- as.numeric(W$tbili)
+W$total_los_includes  <- as.numeric(W$total_los_includes)
+
+```
+
+```{r, class.output="scroll", message=F, warning=F, echo=F, eval=F}
+W %>% select_if(is.factor) %>% summary() %>% kableExtra::kable()
+W %>% select_if(is.numeric) %>% summary() %>% kableExtra::kable()
+```
+
+
+```{r, message=F, class.output="scroll", message=F, warning=F, echo=F}
+ques2 %>%
+  select(id, idx, discharge_date) %>%
+  merge.data.frame(med1, by = "id")%>%
+  merge.data.frame(lab1, by.x = c("id", "visit_date"), by.y = c("id", "ideal_date_labs"),
+                   all.x = T, all.y = T)%>%     # join observed med, lab, with baseline table require the discharge date
+  group_by(id) %>%
+  arrange(id, visit_date) %>%
+  fill(-id, .direction = "down") %>% # unobserved info if filled by last visit 
+  unique()%>%
+  merge.data.frame(med1 %>% select(id, visit_date), by = c("id", "visit_date"), all.y = T)%>%
+  group_by(id) %>%
+  arrange(id, visit_date) %>%
+  mutate(med_date_update = visit_date, # lag(visit_date, default = unique(discharge_date)), no use for now   
+         days_to_visit = as.numeric(difftime(visit_date, discharge_date)),
+         month_to_visit = ceiling(days_to_visit/unit),
+         visits_int = (days_to_visit - lag(days_to_visit, default = 0))/unit)%>%
+  filter(month_to_visit <= min(max_censor, max(ques2$max_censor)))-> med2
+
+med2%>%
+  #mutate_if(is.numeric, funs(replace_na(., 0)))
+  mutate_if(is.character, as.numeric)%>% 
+  mutate(i_aspirin = aspirin * visits_int,  # cumulated binary med
+         i_dipyridamole = dipyridamole * visits_int,
+         i_bb = bb_y_n * visits_int,
+         i_ace = ace_y_n * visits_int,
+         i_arb = arb_y_n * visits_int,
+         i_ccb = ccb_y_n * visits_int,
+         i_aldo = aldo_b_y_n * visits_int,
+         i_pde5i = pde5i_y_n * visits_int,
+         i_loop_d = loop_d_y_n * visits_int,
+         i_thiaz_d = thiaz_d_y_n * visits_int,
+         i_statin = statin_y_n * visits_int,
+         i_amiodarone = amiodarone_y_n * visits_int,
+         i_digoxin = digoxin_y_n * visits_int,
+         i_hydralazine = hydralazine * visits_int,
+         i_ace_arb = ifelse(!is.na(ace_y_n) | !is.na(arb_y_n), 1, NA),
+         i_ace_arb = i_ace_arb * visits_int,
+         ## cumumlated dose
+         d_aspirin = i_aspirin,
+         d_dipyridamole = i_dipyridamole,
+         d_bb = i_bb * bb_dosage,
+         d_ace = ifelse(!is.na(i_ace), i_ace * ace_dosage, 0),
+         d_arb = ifelse(!is.na(i_arb), i_arb * arb_dosage, 0),
+         d_ccb = i_ccb * ccb_dosage ,
+         d_aldo = i_aldo * aldo_b_dosage ,
+         d_pde5i = i_pde5i * pde5i_dosage ,
+         d_loop_d = i_loop_d * loop_d_dosage ,
+         d_thiaz_d = i_thiaz_d * thiaz_d_dosage ,
+         d_statin = i_statin * statin_dosage ,
+         d_amiodarone = i_amiodarone * amiodarone_dosage ,
+         d_digoxin = i_digoxin * digoxin_dosage ,
+         d_hydralazine = i_hydralazine * hydralazine,
+         d_ace_arb = sum(d_ace + d_arb), 
+         nodes = ceiling(month_to_visit / int_tp))-> med3
+
+Med <- med3[, c(3, 60:90 )]%>%
+  filter(nodes > 0) %>%   
+  merge.data.frame(timeframe %>% select(idx, nodes), by = c("idx", "nodes"), all.y = T)%>%  # merge with final timeframe 
+  group_by(idx, nodes)%>%
+  arrange(idx, nodes)%>%
+  summarise_all(sum) 
+
+```
+
+
+```{r, echo=F, class.output="scroll", message=F, warning=F}
+#by(data.frame(Med[, c(2, 18:32)]), data.frame(Med[, c(2, 18:32)])$nodes, summary)
+```
+
+   
+```{r, message=F, warning=F, class.output="scroll", echo=F}
+A <- med3[, c(3, 90, grep("^i_", colnames(med3)))]%>%
+  merge.data.frame(timeframe %>% select(idx, nodes), by = c("idx", "nodes"), all.y = T)%>%
+  group_by(idx, nodes)%>%
+  summarise_all(sum)%>%
+  group_by(idx, nodes)%>% # set key wont be convert
+  mutate_all(funs(ifelse(!is.na(.) & . > 0, 1, 0)))%>% # if ever prescribed as Yes pair with dose data
+  #mutate_all(funs(ifelse(!is.na(.) & . > 0.5*int_tp, 1, 0)))%>% # med prescription > 0 as Yes, L matrix will use cumulated incoperate duration
+  group_by(idx)%>%
+  arrange(nodes)%>%
+  mutate(nodes = lag(nodes, default = 0)) %>%
+  filter((nodes!=max(event2nd$nodes)))%>%
+  arrange(idx)
+
+#by(data.frame(A[, -1]), data.frame(A[, -1])$nodes, summary)
+```
+
+
+```{r, class.output="scroll", message=F, warning=F, echo=F}
+Lab<- med3[, c(3, 90, 49:55)]%>%
+  merge.data.frame(timeframe %>% select(idx, nodes), by = c("idx", "nodes"), all.y = T)%>%
+  group_by(idx, nodes)%>%
+  arrange(idx, nodes)%>%
+  #fill(everything(), .direction = "up")%>%
+  fill(-idx, -nodes, .direction = "down")%>%
+  mutate(lastlab = 1:n())%>%
+  filter(lastlab == max(lastlab))%>%
+  select(-lastlab) 
+  
+#by(data.frame(Lab[, -1]), data.frame(Lab[, -1])$nodes, summary)
+#sum(!is.na(ques2$month_to_gib_or_death))
+```
+
+# Data 
+
+## Data Summary    
+
+
+The dataset includes 128 patients with maximum follow-up time of 51 months after discharge of LVAD implantation, 32 baseline covariates (patient characteristics and lab result), and 25 time-varying covariates (lab results and information of medication prescribed in follow-up visit). 23 patients showed event of interest (GI bleeding or mortality after discharge), 22 patients showed event of interest in the first 18 months.
+
+```{r, echo=F, warning=F, fig.width=7, fig.height=4}
+#sum(!is.na(event2nd$month_to_gib_or_death))
+#sum(!is.na(event2nd$month_to_gib_or_death))
+ggplot(data.frame(table(ques2$month_to_gib_or_death))%>%
+             rename(event_time = Var1, event_count = Freq))+
+  geom_bar(aes(event_time, event_count), stat="identity")+
+  labs(title = "Histogram of GIB/Death event frequence by month of follow-up",
+       x = "Follow-up Time (month)", y = "Event Count")+
+  my_plot_theme()
+
+```
+
+## Censoring, Time Node, Dynamic Treatment Regimes, and Time-Varying Confounders     
+
+Data collection sequence follows: $L_0$, $A_0$, $T_1$, $C_1$, $L_1$, $A_1$, $Y_1$, $C_2$,…… $C_t$, $Y_t$, where $C$ is the binary indicator of censoring, $Y$ is the binary indicator of outcome at time node $t$, $A_0$ ... $A_{t-1}$ is the binary indicator of treatment exposure of medication of interest (Digoxin or Ace/Arb), $L_0$ is the baseline covariates and $L_1$ ... $L_{t-1}$ are the time-varying covariates (lab results and information of medication prescribed in follow-up time node $t$).  The data is also assumed to satisfy assumptions of consistency, positivity, and sequential randomization and no unmeasured confounders.    
+    
+    
+The data is right censored at 18 months after the date of discharge and summarized by time node of a 3 months duration.         
+
+Medication usage of each node is calculate by summarizing duration in days within each time node, avaliable information in dosage is in cooperated as multiplier to the duration. Lab result of each node is the average values of avaliable information in each time node.     
+    
+    
+Binary treatment indicator is evaluated by whether the cumulative time of medicine usage is >0.   
+
+
+# Method
+
+## Survival Marginal Structual Model
+
+$\lambda_{T_\overline{a}}(t|L)=\lambda_0(t)exp(\beta_1a(t)+\beta_2Cum.a)$    
+where $\lambda_0(t)$ is the unspecified baseline hazard, $\lambda_{T_\overline{a}}(t|L)$ is the hazard of adverse event at time $t$ among subjects followed treatment history $\overline{a}$ through time $t$. The parameter $\beta_1$ is the causal hazard log ratio of the treatment of interest (Digoxin or Ace/Arb) at time $t$ under dynamic treatment regimes. $\beta_2$ is the causal hazard log ratio of the cumulative Digoxin treatment time $Cum.a$, which is the summarized variable of the empirical treatment regimens observed in the dataset.     
+
+# Result
+
+## Digoxin 18-month censoring / 3-month node  
+
+```{r, echo=F}
+#i_ace_arb , i_digoxin, i_aspirin
+med_to_check  <- "i_digoxin"
+```
+
+### Digoxin Treatment Timeline    
+```{r, message=F, warning=F, echo=F, fig.width=7, fig.height=6, fig.align="center"}
+col_text <- "Digoxin Prescription"
+title_text <- "Digoxin Treatment Timeline"
+sub_text <- "Event: Death or GIB"
+ 
+event2nd %>% 
+  merge.data.frame(A[, c("idx", "nodes", med_to_check)], by = c("idx", "nodes"), all = T) %>%
+  group_by(idx)%>%
+  arrange(idx, nodes)%>%
+  fill(-idx, .direction = "down")%>%
+  mutate(censored_death = lag(ifelse(!is.na(month_to_DorB_censored)|!is.na(month_to_gib_or_death), 1, NA)),
+         Event_circle = ifelse(!is.na(month_to_gib_or_death), nodes, NA))%>%
+  filter(is.na(censored_death))%>%
+  ggplot(aes(nodes, idx, group=idx, col=factor(get(med_to_check)))) +
+  geom_line(size=.4) +
+  geom_point(shape=15, size= 1) +
+  geom_point(aes(Event_circle), col="black", shape=4, size=2) +
+  theme_classic() + 
+  scale_x_continuous(expand=c(0,0.1), breaks = seq(0, max_censor/int_tp), labels = seq(0, max_censor, by = int_tp)) +
+  scale_y_continuous(expand=c(0.01,0.01)) +
+  labs(x="Months since Discharge", y="Patient ID", col=col_text, title=title_text) +
+  scale_color_manual(labels=c("No","Yes"), values=c("#FFC72C","#B31B1B")) +
+  theme(legend.position = "bottom",text=element_text(size=10),
+        legend.box.background = element_rect(color = "black"),
+        legend.background = element_blank(),
+        plot.title = element_text(hjust = 0.5))
+```
+
+  
+```{r, class.output="scroll", echo=F, message=F, warning=F, results="hide"}
+L <- merge.data.frame(Med, Lab)
+#summary(L)
+#colnames(L)
+#L <- L[, -c(grep("^i_", colnames(L)))]
+L <- L[, -c(grep("^i_", colnames(L)))]
+#L <- L[, c(!is.element(colnames(L), gsub("^i_", "d_", med_to_check)))]
+
+Lnode.list <- list()
+for (Var in 3:ncol(L)) {
+  i <- colnames(L)[Var]
+  Lnode.list[[i]]<- 
+    data.frame(L[, c("idx", "nodes", i)])%>%
+    reshape(v.names = i, idvar = "idx", timevar = "nodes", direction = "wide")%>%
+    mutate_all(list(~replace_na(.,0)))
+  colnames(Lnode.list[[i]]) <- c("PatientID", paste(i, 1:length(unique(L$nodes)), "_", sep = "_"))
+  Lnode.list[[i]] <- Lnode.list[[i]][,-1]
+}
+L.matrix <- do.call(cbind, Lnode.list)
+#colnames(L.matrix) <- gsub("^.*L", "L", colnames(L.matrix), perl = T)
+
+c.matrix <- timeframe%>%
+  data.frame()%>% 
+  dplyr::select(idx, nodes, censor)%>%
+  reshape(v.names = "censor", idvar = "idx", timevar = "nodes", direction = "wide")
+colnames(c.matrix) <- c("PatientID", paste("C_", 1:max(event2nd$nodes), "_", sep = ""))
+
+
+y.matrix <- timeframe %>%
+  dplyr::select(idx, nodes, event)%>%
+  data.frame()%>%
+  reshape(v.names = "event", idvar = "idx", timevar = "nodes", direction = "wide")%>%
+  mutate_all(funs(ifelse(is.na(.), 0, .)))
+colnames(y.matrix) <- c("PatientID", paste("Y_", 1:max(event2nd$nodes), "_", sep = ""))
+
+#lapply(2:(ncol(y.matrix)-1), function(x) table(trt.matrix[,x], y.matrix[,x]))
+```
+
+### Time-varying Covariates View 
+```{r, message=F, warning=F, echo=F, results="hide", fig.align="center", fig.width=7, fig.height=5}
+hm <- L %>%
+  filter(idx %in% c(7, 5, 69)) 
+col_anno <- data.frame(Month = hm$nodes*3,
+                       patientID = factor(hm$idx),
+                       Digoxin = ifelse(is.na(hm$d_digoxin), "no", "yes"))
+hm1 <- t(as.matrix(hm[, 3: ncol(hm)]))
+#####change
+rownames(col_anno) <- colnames(hm1) <- 1:ncol(hm1)
+
+pheatmap::pheatmap(hm1, scale = "row", cluster_rows = F, cluster_cols = F, annotation_col = col_anno, na_col = "white", show_colnames = F, gaps_col = c(max(hm$nodes), max(hm$nodes)*2),# cellheight = 11,
+                   main = "Time-varying Covariates View of 3 Patients")
+```
+
+### Baseline Covariates Summary    
+```{r, class.output="scroll", message=F, warning=F, echo=F}
+library(gtsummary)
+trt.matrix <- A%>%
+  data.frame()%>%
+  select(idx, nodes, med_to_check)%>%
+  reshape(v.names = med_to_check, idvar = "idx", timevar = "nodes", direction = "wide")%>%
+  mutate_all(list(~replace_na(.,0))) 
+colnames(trt.matrix) <- c("PatientID", paste("A_", c(0: (max(event2nd$nodes)-1)), "_", sep = ""))
+diox <- factor(ifelse(rowSums(trt.matrix[, -1]) != 0, "DIGOXIN~Yes", "DIGOXIN~Never"))
+
+tableW <- W[, -33]
+tableW$trt <- diox
+colnames(tableW) <- toupper(colnames(tableW))
+
+tbl_summary(tableW, by = TRT)%>%
+  bold_labels()%>%
+  as_gt()
+```
+
+### Time-varying Covariates Summary 
+
+```{r,class.output="scroll", echo=F}
+L.matrix$PatientID <- trt.matrix$PatientID
+tableL <- L.matrix[ ,-133]
+tableL <- tableL%>%mutate_all(.funs = as.numeric)
+colnames(tableL) <- gsub("^.*\\.", "", colnames(tableL))
+colnames(tableL) <- toupper(gsub("d_", "", colnames(tableL)))
+colnames(tableL) <- gsub("__", "", colnames(tableL))
+  
+alltp <- sapply(seq(1, 90, by = 6), function(x){
+  rowSums(tableL[, x : (x+5)])
+})
+colnames(alltp) <- gsub("_1", "", colnames(tableL)[seq(1, 90, by = 6)])
+
+alltpave <- sapply(seq(91, 132, by = 6), function(x){
+  rowSums(tableL[, x : (x+5)])
+})
+colnames(alltpave) <- gsub("_1", "", colnames(tableL)[seq(91, 132, by = 6)])
+tableLall <- cbind.data.frame(alltp, alltpave)
+```
+
+
+**Overall Time-varying Covariates Summary**
+```{r, class.output="scroll",echo=F}
+tableLall$TRT <- diox
+
+tbl_summary(tableLall, by = TRT, type = list(all_numeric() ~ "continuous"), digits = list(all_numeric() ~ c(2,2)))%>%
+  bold_labels()%>%
+  as_gt()
+```
+
+### Unadjusted Cox proportional hazards model      
+```{r, message=F, warning=F, echo=F, fig.align="center", fig.width=7, fig.height=6, results="hide"}
+surv_dat <- 
+  expand.grid(id = event2nd$id, 
+            nodes = 1:(max(event2nd$nodes))) %>% 
+  merge.data.frame(ques2 %>%
+                     select(id, month_to_outcome, month_to_gib_or_death, idx)%>%
+                     mutate(month_to_outcome = ceiling(month_to_outcome / int_tp)), all.x = T)%>%
+  group_by(id)%>%
+  arrange(id, nodes)%>%
+  filter(nodes <= max(event2nd$nodes))%>%
+  fill(month_to_gib_or_death, .direction = "down")%>%
+  mutate(ever_event = ifelse(!is.na(month_to_gib_or_death), 1, 0))%>%
+  merge.data.frame(A%>%select(idx, i_digoxin) %>%  #---------change ---------------  i_ace_arb   i_digoxin
+                     group_by(idx) %>%
+                     summarize(Digoxin = ifelse(sum(i_digoxin) != 0, "Yes", "Never"))%>%
+                     data.frame(), all.x = T, by = "idx")%>% #---------change ---------------  i_ace_arb   i_digoxin
+  select(-idx, -id, -nodes, -month_to_gib_or_death)
+
+
+colnames(surv_dat)
+head(surv_dat)
+
+fit <- survfit(Surv(month_to_outcome, ever_event) ~ Digoxin, data = surv_dat)
+ggsurvplot(fit, data = surv_dat, censor = T, palette = "jco", pval = F, pval.coord = c(12, 0.8))
+#ace_arb <- survfit(Surv(month_to_outcome, ever_event) ~ ace_arb, data = surv_dat)
+
+fit <- survival::coxph(Surv(month_to_outcome, ever_event) ~ Digoxin, data = surv_dat)
+```
+
+```{r, echo=F, eval=F}
+summary(fit)
+```
+
+
+The unadjusted HR of Digoxin was `r round(summary(fit)$coefficients[2], 2)` (95% CI: `r round(summary(fit)$conf.int[3], 2)` - `r round(summary(fit)$conf.int[4], 2)`).
+
+### The covariate-adjusted time-dependent Cox proportional hazards model   
+```{r, echo=F}
+load("../data/18M_3I_ic_diox.RData")
+#summary(result.regList)
+cuma <- summary(result.regList)$cmat["cum.A",]
+```
+
+The time-dependent covariate-adjusted HR of Digoxin was `r round(exp(cuma[1]), 2)` (95% CI: `r round(exp(cuma[3]), 2)` - `r round(exp(cuma[4]), 2)`).
+
+### HR Summary Table    
+
+|               |      Hazards Ratio                          |       95% CI                                                                  | p-Value                                                 |   
+|---------------|---------------------------------------------|-------------------------------------------------------------------------------|---------------------------------------------------------|
+| Unadjusted    | `r round(summary(fit)$coefficients[2], 2)`  | `r round(summary(fit)$conf.int[3], 2)`-`r round(summary(fit)$conf.int[4], 2)` |   `r round(summary(fit)$waldtest[3], 2)`  |
+| Adjusted      | `r round(exp(cuma[1]), 2)`                  | `r round(exp(cuma[3]), 2)`-`r round(exp(cuma[4]), 2)`                         |   `r round(cuma[5], 2)`                                  |
+
+
+
+
+## Ace/Arb 18-month censoring / 3-month node    
+
+```{r, echo=F}
+#i_ace_arb , i_digoxin, i_aspirin
+med_to_check  <- "i_ace_arb"
+```
+
+### Ace/Arb Treatment Timeline    
+```{r, message=F, warning=F, echo=F, fig.width=7, fig.height=6, fig.align="center"}
+col_text <- "Ace/Arb Prescription"
+title_text <- "Ace/Arb Treatment Timeline"
+sub_text <- "Event: Death or GIB"
+ 
+event2nd %>% 
+  merge.data.frame(A[, c("idx", "nodes", med_to_check)], by = c("idx", "nodes"), all = T) %>%
+  group_by(idx)%>%
+  arrange(idx, nodes)%>%
+  fill(-idx, .direction = "down")%>%
+  mutate(censored_death = lag(ifelse(!is.na(month_to_DorB_censored)|!is.na(month_to_gib_or_death), 1, NA)),
+         Event_circle = ifelse(!is.na(month_to_gib_or_death), nodes, NA))%>%
+  filter(is.na(censored_death))%>%
+  ggplot(aes(nodes, idx, group=idx, col=factor(get(med_to_check)))) +
+  geom_line(size=.4) +
+  geom_point(shape=15, size= 1) +
+  geom_point(aes(Event_circle), col="black", shape=4, size=2) +
+  theme_classic() + 
+  scale_x_continuous(expand=c(0,0.1), breaks = seq(0, max_censor/int_tp), labels = seq(0, max_censor, by = int_tp)) +
+  scale_y_continuous(expand=c(0.01,0.01)) +
+  labs(x="Months since Discharge", y="Patient ID", col=col_text, title=title_text) +
+  scale_color_manual(labels=c("No","Yes"), values=c("#FFC72C","#B31B1B")) +
+  theme(legend.position = "bottom",text=element_text(size=10),
+        legend.box.background = element_rect(color = "black"),
+        legend.background = element_blank(),
+        plot.title = element_text(hjust = 0.5))
+```
+
+
+### Time-varying Covariates View 
+```{r, message=F, warning=F, echo=F, results="hide", fig.align="center", fig.width=7, fig.height=5}
+hm <- L %>%
+  filter(idx %in% c(3, 5, 69)) 
+col_anno <- data.frame(Month = hm$nodes*3,
+                       patientID = factor(hm$idx),
+                       Ace_or_Arb = ifelse(is.na(hm$d_ace)&is.na(hm$d_arb), "no", "yes"))
+hm1 <- t(as.matrix(hm[, 3: ncol(hm)]))
+
+rownames(col_anno) <- colnames(hm1) <- 1:ncol(hm1)
+
+pheatmap::pheatmap(hm1, scale = "row", cluster_rows = F, cluster_cols = F, annotation_col = col_anno, na_col = "white", show_colnames = F, gaps_col = c(max(hm$nodes), max(hm$nodes)*2),# cellheight = 11,
+                   main = "Time-varying Covariates View of 3 Patients")
+```
+
+ 
+```{r, class.output="scroll", message=F, warning=F, echo=F}
+trt.matrix <- A%>%
+  data.frame()%>%
+  select(idx, nodes, med_to_check)%>%
+  reshape(v.names = med_to_check, idvar = "idx", timevar = "nodes", direction = "wide")%>%
+  mutate_all(list(~replace_na(.,0))) 
+colnames(trt.matrix) <- c("PatientID", paste("A_", c(0: (max(event2nd$nodes)-1)), "_", sep = ""))
+L.matrix$PatientID <- trt.matrix$PatientID
+
+
+CLAY <- merge.data.frame(c.matrix, L.matrix, by = "PatientID")%>%
+  merge.data.frame(trt.matrix, by = "PatientID")%>%
+  merge.data.frame(y.matrix, by = "PatientID")
+
+#CLAY <- merge.data.frame(c.matrix, trt.matrix, by = "PatientID")%>% merge.data.frame(y.matrix, by = "PatientID")
+
+Temp.CLAY <- CLAY[, c(1, grep("*_0_", colnames(CLAY)))]
+
+for (i in 1 : (ncol(y.matrix)-1)) {
+  pat <- paste(".*_", i, "_", sep = "")
+  Temp.CLAY <- cbind.data.frame(Temp.CLAY, CLAY[, c(grep(pattern = pat, colnames(CLAY)))])
+}
+
+finaldf <- W%>%
+  merge.data.frame(Temp.CLAY, by.x = "idx", by.y = "PatientID")%>%
+  dplyr::select(-idx)
+
+for (i in grep("C_*_", names(finaldf))) {
+  finaldf[, i] <- factor(finaldf[, i], levels = c(0,1), labels = c("uncensored", "censored"))
+}
+
+```
+
+### Baseline Covariates Summary    
+```{r, class.output="scroll", message=F, warning=F, echo=F}
+trt.matrix <- A%>%
+  data.frame()%>%
+  select(idx, nodes, med_to_check)%>%
+  reshape(v.names = med_to_check, idvar = "idx", timevar = "nodes", direction = "wide")%>%
+  mutate_all(list(~replace_na(.,0))) 
+colnames(trt.matrix) <- c("PatientID", paste("A_", c(0: (max(event2nd$nodes)-1)), "_", sep = ""))
+ace_arb <- factor(ifelse(rowSums(trt.matrix[, -1]) != 0, "Ace/Arb~Yes", "Ace/Arb~Never"))
+
+tableW <- W[, -33]
+tableW$trt <- ace_arb
+colnames(tableW) <- toupper(colnames(tableW))
+
+tbl_summary(tableW, by = TRT)%>%
+  bold_labels()%>%
+  as_gt()
+```
+
+### Time-varying Covariates Summary 
+
+**Overall Time-varying Covariates Summary**
+```{r, class.output="scroll",echo=F}
+
+tableLall$TRT <- ace_arb
+
+tbl_summary(tableLall, by = TRT, type = list(all_numeric() ~ "continuous"), digits = list(all_numeric() ~ c(2,2)))%>%
+  bold_labels()%>%
+  as_gt()
+```
+
+### Unadjusted Cox proportional hazards model      
+```{r, message=F, warning=F, echo=F, fig.align="center", fig.width=7, fig.height=6, results="hide"}
+surv_dat <- 
+  expand.grid(id = event2nd$id, 
+            nodes = 1:(max(event2nd$nodes))) %>% 
+  merge.data.frame(ques2 %>%
+                     select(id, month_to_outcome, month_to_gib_or_death, idx)%>%
+                     mutate(month_to_outcome = ceiling(month_to_outcome / int_tp)), all.x = T)%>%
+  group_by(id)%>%
+  arrange(id, nodes)%>%
+  filter(nodes <= max(event2nd$nodes))%>%
+  fill(month_to_gib_or_death, .direction = "down")%>%
+  mutate(ever_event = ifelse(!is.na(month_to_gib_or_death), 1, 0))%>%
+  merge.data.frame(A%>%select(idx, i_ace_arb) %>%  #---------change ---------------  i_ace_arb   i_digoxin
+                     group_by(idx) %>%
+                     summarize(Ace_or_Arb = ifelse(sum(i_ace_arb) != 0, "Yes", "Never"))%>%
+                     data.frame(), all.x = T, by = "idx")%>% #---------change ---------------  i_ace_arb   i_digoxin
+  select(-idx, -id, -nodes, -month_to_gib_or_death)
+
+
+colnames(A)
+head(surv_dat)
+
+fit <- survfit(Surv(month_to_outcome, ever_event) ~ Ace_or_Arb, data = surv_dat)
+ggsurvplot(fit, data = surv_dat, censor = T, palette = "jco", pval = F, pval.coord = c(12, 0.85))
+#ace_arb <- survfit(Surv(month_to_outcome, ever_event) ~ ace_arb, data = surv_dat)
+
+fit <- survival::coxph(Surv(month_to_outcome, ever_event) ~ Ace_or_Arb, data = surv_dat)
+```
+
+```{r, echo=F, eval=F}
+summary(fit)
+```
+
+
+The unadjusted HR of Ace/Arb was `r round(summary(fit)$coefficients[2], 2)` (95% CI: `r round(summary(fit)$conf.int[3], 2)` - `r round(summary(fit)$conf.int[4], 2)`).
+
+### The covariate-adjusted time-dependent Cox proportional hazards model   
+```{r, echo=F}
+load("../data/18M_3I_ic_ace_arb.RData")
+#summary(result.regList)
+cuma <- summary(result.regList)$cmat["cum.A",]
+```
+
+The time-dependent covariate-adjusted HR of Ace/Arb was `r round(exp(cuma[1]), 2)` (95% CI: `r round(exp(cuma[3]), 2)` - `r round(exp(cuma[4]), 2)`).
+
+### HR Summary Table    
+
+|               |      Hazards Ratio                          |       95% CI                                                                  | p-Value                                                 |   
+|---------------|---------------------------------------------|-------------------------------------------------------------------------------|---------------------------------------------------------|
+| Unadjusted    | `r round(summary(fit)$coefficients[2], 2)`  | `r round(summary(fit)$conf.int[3], 2)`-`r round(summary(fit)$conf.int[4], 2)` |   `r round(summary(fit)$waldtest[3], 2)`  |
+| Adjusted      | `r round(exp(cuma[1]), 2)`                  | `r round(exp(cuma[3]), 2)`-`r round(exp(cuma[4]), 2)`                         |   `r ifelse(round(cuma[5], 2) < 0.01, "<0.01", round(cuma[5], 2))`                                  |
+
+## Pde5i 18-month censoring / 3-month node    
+
+### pde5i Treatment Timeline    
+```{r, message=F, warning=F, echo=F, fig.width=7, fig.height=6, fig.align="center"}
+col_text <- "pde5i Prescription"
+title_text <- "pde5i Treatment Timeline"
+sub_text <- "Event: Death or GIB"
+ 
+event2nd %>% 
+  merge.data.frame(A[, c("idx", "nodes", med_to_check)], by = c("idx", "nodes"), all = T) %>%
+  group_by(idx)%>%
+  arrange(idx, nodes)%>%
+  fill(-idx, .direction = "down")%>%
+  mutate(censored_death = lag(ifelse(!is.na(month_to_DorB_censored)|!is.na(month_to_gib_or_death), 1, NA)),
+         Event_circle = ifelse(!is.na(month_to_gib_or_death), nodes, NA))%>%
+  filter(is.na(censored_death))%>%
+  ggplot(aes(nodes, idx, group=idx, col=factor(get(med_to_check)))) +
+  geom_line(size=.4) +
+  geom_point(shape=15, size= 1) +
+  geom_point(aes(Event_circle), col="black", shape=4, size=2) +
+  theme_classic() + 
+  scale_x_continuous(expand=c(0,0.1), breaks = seq(0, max_censor/int_tp), labels = seq(0, max_censor, by = int_tp)) +
+  scale_y_continuous(expand=c(0.01,0.01)) +
+  labs(x="Months since Discharge", y="Patient ID", col=col_text, title=title_text) +
+  scale_color_manual(labels=c("No","Yes"), values=c("#FFC72C","#B31B1B")) +
+  theme(legend.position = "bottom",text=element_text(size=10),
+        legend.box.background = element_rect(color = "black"),
+        legend.background = element_blank(),
+        plot.title = element_text(hjust = 0.5))
+```
+
+
+### Time-varying Covariates View 
+```{r, message=F, warning=F, echo=F, results="hide", fig.align="center", fig.width=7, fig.height=5}
+hm <- L %>%
+  filter(idx %in% c(3, 7, 10)) 
+col_anno <- data.frame(Month = hm$nodes*3,
+                       patientID = factor(hm$idx),
+                       Pde5i = ifelse(is.na(hm$d_pde5i), "no", "yes"))
+hm1 <- t(as.matrix(hm[, 3: ncol(hm)]))
+
+rownames(col_anno) <- colnames(hm1) <- 1:ncol(hm1)
+
+pheatmap::pheatmap(hm1, scale = "row", cluster_rows = F, cluster_cols = F, annotation_col = col_anno, na_col = "white", show_colnames = F, gaps_col = c(max(hm$nodes), max(hm$nodes)*2),# cellheight = 11,
+                   main = "Time-varying Covariates View of 3 Patients")
+```
+
+ 
+```{r, class.output="scroll", message=F, warning=F, echo=F}
+trt.matrix <- A%>%
+  data.frame()%>%
+  select(idx, nodes, med_to_check)%>%
+  reshape(v.names = med_to_check, idvar = "idx", timevar = "nodes", direction = "wide")%>%
+  mutate_all(list(~replace_na(.,0))) 
+colnames(trt.matrix) <- c("PatientID", paste("A_", c(0: (max(event2nd$nodes)-1)), "_", sep = ""))
+L.matrix$PatientID <- trt.matrix$PatientID
+
+
+CLAY <- merge.data.frame(c.matrix, L.matrix, by = "PatientID")%>%
+  merge.data.frame(trt.matrix, by = "PatientID")%>%
+  merge.data.frame(y.matrix, by = "PatientID")
+
+#CLAY <- merge.data.frame(c.matrix, trt.matrix, by = "PatientID")%>% merge.data.frame(y.matrix, by = "PatientID")
+
+Temp.CLAY <- CLAY[, c(1, grep("*_0_", colnames(CLAY)))]
+
+for (i in 1 : (ncol(y.matrix)-1)) {
+  pat <- paste(".*_", i, "_", sep = "")
+  Temp.CLAY <- cbind.data.frame(Temp.CLAY, CLAY[, c(grep(pattern = pat, colnames(CLAY)))])
+}
+
+finaldf <- W%>%
+  merge.data.frame(Temp.CLAY, by.x = "idx", by.y = "PatientID")%>%
+  dplyr::select(-idx)
+
+for (i in grep("C_*_", names(finaldf))) {
+  finaldf[, i] <- factor(finaldf[, i], levels = c(0,1), labels = c("uncensored", "censored"))
+}
+
+#write_delim(finaldf, paste0("./", title_text, "_max_censoring_", max_censor, "_at_", int_tp, ".txt"))
+```
+
+### Baseline Covariates Summary    
+```{r, class.output="scroll", message=F, warning=F, echo=F}
+trt.matrix <- A%>%
+  data.frame()%>%
+  select(idx, nodes, med_to_check)%>%
+  reshape(v.names = med_to_check, idvar = "idx", timevar = "nodes", direction = "wide")%>%
+  mutate_all(list(~replace_na(.,0))) 
+colnames(trt.matrix) <- c("PatientID", paste("A_", c(0: (max(event2nd$nodes)-1)), "_", sep = ""))
+Pde5i <- factor(ifelse(rowSums(trt.matrix[, -1]) != 0, "Pde5i~Yes", "Pde5i~Never"))
+
+tableW <- W[, -33]
+tableW$trt <- Pde5i
+colnames(tableW) <- toupper(colnames(tableW))
+
+tbl_summary(tableW, by = TRT)%>%
+  bold_labels()%>%
+  as_gt()
+```
+
+### Time-varying Covariates Summary 
+
+**Overall Time-varying Covariates Summary**
+```{r, class.output="scroll",echo=F}
+
+tableLall$TRT <- Pde5i
+
+tbl_summary(tableLall, by = TRT, type = list(all_numeric() ~ "continuous"), digits = list(all_numeric() ~ c(2,2)))%>%
+  bold_labels()%>%
+  as_gt()
+```
+
+### Unadjusted Cox proportional hazards model      
+```{r, message=F, warning=F, echo=F, fig.align="center", fig.width=7, fig.height=6, results="hide"}
+surv_dat <- 
+  expand.grid(id = event2nd$id, 
+            nodes = 1:(max(event2nd$nodes))) %>% 
+  merge.data.frame(ques2 %>%
+                     select(id, month_to_outcome, month_to_gib_or_death, idx)%>%
+                     mutate(month_to_outcome = ceiling(month_to_outcome / int_tp)), all.x = T)%>%
+  group_by(id)%>%
+  arrange(id, nodes)%>%
+  filter(nodes <= max(event2nd$nodes))%>%
+  fill(month_to_gib_or_death, .direction = "down")%>%
+  mutate(ever_event = ifelse(!is.na(month_to_gib_or_death), 1, 0))%>%
+  merge.data.frame(A%>%select(idx, i_pde5i) %>%  #---------change ---------------  i_ace_arb   i_digoxin
+                     group_by(idx) %>%
+                     summarize(Pde5i = ifelse(sum(i_pde5i) != 0, "Yes", "Never"))%>%
+                     data.frame(), all.x = T, by = "idx")%>% #---------change ---------------  i_ace_arb   i_digoxin
+  select(-idx, -id, -nodes, -month_to_gib_or_death)
+
+
+colnames(A)
+head(surv_dat)
+
+fit <- survfit(Surv(month_to_outcome, ever_event) ~ Pde5i, data = surv_dat)
+ggsurvplot(fit, data = surv_dat, censor = T, palette = "jco", pval = F, pval.coord = c(12, 0.85))
+#ace_arb <- survfit(Surv(month_to_outcome, ever_event) ~ ace_arb, data = surv_dat)
+
+fit <- survival::coxph(Surv(month_to_outcome, ever_event) ~ Pde5i, data = surv_dat)
+```
+
+```{r, echo=F, eval=F}
+summary(fit)
+```
+
+
+The unadjusted HR of Pde5i was `r round(summary(fit)$coefficients[2], 2)` (95% CI: `r round(summary(fit)$conf.int[3], 2)` - `r round(summary(fit)$conf.int[4], 2)`).
+
+### The covariate-adjusted time-dependent Cox proportional hazards model   
+```{r, echo=F}
+load("../data/18M_3I_pde5i_ic.RData")
+#summary(result.regList)
+cuma <- summary(result.regList)$cmat["cum.A",]
+```
+
+The time-dependent covariate-adjusted HR of Pde5i was `r round(exp(cuma[1]), 2)` (95% CI: `r round(exp(cuma[3]), 2)` - `r round(exp(cuma[4]), 2)`).
+
+### HR Summary Table    
+
+|               |      Hazards Ratio                          |       95% CI                                                                  | p-Value                                                 |   
+|---------------|---------------------------------------------|-------------------------------------------------------------------------------|---------------------------------------------------------|
+| Unadjusted    | `r round(summary(fit)$coefficients[2], 2)`  | `r round(summary(fit)$conf.int[3], 2)`-`r round(summary(fit)$conf.int[4], 2)` |   `r round(summary(fit)$waldtest[3], 2)`  |
+| Adjusted      | `r round(exp(cuma[1]), 2)`                  | `r round(exp(cuma[3]), 2)`-`r round(exp(cuma[4]), 2)`                         |   `r ifelse(round(cuma[5], 2) < 0.01, "<0.01", round(cuma[5], 2))`  
+
+
+
+
+## Appendix
+
+### Digoxin Per-node Time-varying Covariates Summary
+```{r, class.output="scroll",echo=F}
+
+tableL$TRT <- diox
+
+tbl_summary(tableL, by = TRT, type = list(all_numeric() ~ "continuous"), digits = list(all_numeric() ~ c(2,2)))%>%
+  bold_labels()%>%
+  as_gt()
+```
+
+### Ace/Arb Per-node Time-varying Covariates Summary
+```{r, class.output="scroll",echo=F}
+tableL$TRT <- ace_arb
+
+tbl_summary(tableL, by = TRT, type = list(all_numeric() ~ "continuous"), digits = list(all_numeric() ~ c(2,2)))%>%
+  bold_labels()%>%
+  as_gt()
+```
+
+### Pde5i Per-node Time-varying Covariates Summary
+```{r, class.output="scroll",echo=F}
+tableL$TRT <- Pde5i
+
+tbl_summary(tableL, by = TRT, type = list(all_numeric() ~ "continuous"), digits = list(all_numeric() ~ c(2,2)))%>%
+  bold_labels()%>%
+  as_gt()
+```

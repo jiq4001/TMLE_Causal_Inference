@@ -1,0 +1,721 @@
+---
+title: "TMLE Data Summary and Wragling"
+author: "Jingjing Qi"
+date: "April 6, 2020; updated `r Sys.Date()`"
+output:
+  rmarkdown::html_vignette:
+    toc: true
+vignette: >
+  %\VignetteEncoding{UTF-8}
+  %\VignetteIndexEntry{1. Processing Data: 0606T1, D10T3, 21LT2}
+  %\VignetteEngine{knitr::rmarkdown}
+editor_options: 
+  chunk_output_type: console
+---
+
+```{css, echo=F}
+.scroll {
+  max-height: 300px;
+  overflow-y: auto;
+}
+```
+
+```{r, echo=FALSE}
+my_plot_theme <- function () {
+  theme_classic() %+replace% 
+        theme(panel.border = element_blank(), panel.grid.major = element_blank(), 
+              plot.title = element_text(face = "bold", hjust = 0.5, size = 14),
+              legend.position = "bottom",
+              panel.grid.minor = element_blank(), 
+              axis.line = element_line(colour = "black", size = rel(1)), legend.key = element_blank(), 
+              strip.background = element_rect(fill = "white", colour = "black", size = rel(2)), 
+              complete = TRUE)
+  }
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(magrittr)
+library(janitor)
+library(mice)
+library(survival)
+library(survminer)
+```
+
+
+```{r, class.output="scroll", message=F, warning=F, echo=F}
+########
+# med
+########
+med1 <- readxl::read_xlsx("inst/data/BaselineHM3Labs.discharge.xlsx", 
+                             sheet = 1) %>% 
+  clean_names() %>% 
+  filter(!is.na(id)) %>%
+  dplyr::mutate(visit_date = as.Date(visit_date))
+```
+
+```{r, class.output="scroll", message=F, warning=F, echo=F}
+########
+# outcome and baseline var
+########
+add_1 <- readxl::read_xlsx("inst/data/BaselineHM3Labs.discharge.xlsx", 
+                             sheet = 2) %>% 
+  clean_names() %>% 
+  filter(!is.na(id)) %>%
+  dplyr::mutate(discharge_date = as.Date(discharge_date))
+
+ques1 <- readxl::read_xlsx("inst/data/medication spreadsheet 3.14 HM3 only deidentified.xlsx", 
+                             sheet = 2) %>% 
+  clean_names() %>%
+  dplyr::mutate(admitted = as.Date(admitted),
+         implant_date = as.Date(implant_date),
+         discharge_date = as.Date(discharge_date),
+         mcs_start_date = as.Date(as.numeric(mcs_start_date), origin = "1899-12-30"),
+         x1st_device_exchange_date = as.Date(as.numeric(x1st_device_exchange_date), origin = "1899-12-30"),
+         outcome_date = as.Date(outcome_date),
+         gib_date = as.Date(as.numeric(gib_date), origin = "1899-12-30")) %>%
+         dplyr::mutate_if(is.character, tolower) %>%
+         dplyr::mutate(race = case_when(hispanic_yes_no == "yes" ~ "hisp",
+                                race_afroamerican == "yes" ~ "afam",
+                                race_white == "yes" ~ "white",
+                                race_asian == "yes" ~ "asian",
+                                TRUE ~ "others")) %>%
+  merge.data.frame(add_1, by = c("id", "discharge_date"))
+
+ques1$idx <- 1: nrow(ques1) # simple index
+```
+
+```{r, class.output="scroll", message=F, warning=F, echo=F}
+########
+# lab  type_mcs_support_1
+########
+lab1 <- readxl::read_xlsx("inst/data/BaselineHM3Labs.discharge.xlsx", 
+                             sheet = 3) %>% 
+  clean_names() %>%
+  select(-visit_n, -visit_date_meds, -comments) %>%  # only keep lab data for relationship table
+  filter(!is.na(ideal_date_labs)) %>%
+  dplyr::mutate(ideal_date_labs = as.Date(as.numeric(ideal_date_labs), origin = "1899-12-30"),
+         id = factor(id)) %>%
+  dplyr::mutate_if(is.character, as.numeric) 
+```
+
+# Read in datasets:    
+* med1: medication and dosage data on avaliable follow-up dates, `BaselineHM3Labs.discharge.xlsx", sheet = 1`     
+```{r, echo=F}
+med1%>%kableExtra::kable()%>%kableExtra::kable_styling()%>%kableExtra::scroll_box(height = "200px")
+```
+
+* ques1: Baseline Questionnaire: demographic, outcome, baseline date, outcome date, `medication spreadsheet 3.14 HM3 only deidentified.xlsx",sheet = 2` , addational baseline lab data. `BaselineHM3Labs.discharge.xlsx", sheet = 1`    
+```{r, echo=F}
+ques1%>%kableExtra::kable()%>%kableExtra::kable_styling()%>%kableExtra::scroll_box(height = "200px")
+```
+
+* lab1: Lab data on avaliable dates during follow-up period. `BaselineHM3Labs.discharge.xlsx", sheet = 3`          
+```{r, echo=F}
+lab1%>%kableExtra::kable()%>%kableExtra::kable_styling()%>%kableExtra::scroll_box(height = "200px")
+```    
+
+Treatment regimes under administrative censoring by month 
+![](../inst/figures/i_ace_arb Treatment Timeline.png){width=700px height=700px}
+![](../inst/figures/i_digoxin Treatment Timeline.png){width=700px height=700px}
+
+# Data Wragling
+
+## Set censoring timeframe, interval between nodes:    
+Time elaps is calculated in the unit of Month. `int_tp`: interval between time nodes. `max_censor`: costum maximum censoring time.    
+
+```{r}
+unit = 30 #days/  date to month
+int_tp = 3#month/ between nodes
+max_censor <- 18 #/months use large number for admistritive sencoring or desired max time frame   (max gib/death happened at 25month)
+```
+
+## Set Treatment Medication of interest      
+* Digoxin: `i_digoxin` or 
+* Either on Ace or Arb: `i_ace_arb`
+```{r}
+#i_ace_arb , i_digoxin, i_aspirin i_pde5i
+med_to_check  <- "i_ace_arb"
+```
+
+
+## Create event variables    
+The first occurance of either GI Bleeding or Death.    
+
+```{r, class.output="scroll", message=F, warning=F, echo=F, fig.align="center"}
+#unique(ques1$final_outcome_reason)
+ques1 %>%
+  select(id, idx, discharge_date, outcome_date, final_outcome_reason, ever_gib_yes_1_no_0, gib_date) %>%
+  mutate(month_to_outcome = ceiling(as.numeric(difftime(outcome_date, discharge_date)/unit)),
+         max_censor = min(max_censor, max(month_to_outcome)),
+         month_to_death = ifelse(final_outcome_reason == "expired", month_to_outcome, NA),
+         #DorC = ifelse(final_outcome_reason == "expired" | month_to_outcome >= max_censor, 1, 0),
+         month_to_censored_d = ifelse(!is.na(month_to_death) & (month_to_outcome < max_censor), NA, pmin(max_censor, month_to_outcome)),
+         month_to_gib = ceiling(as.numeric(difftime(gib_date, discharge_date)/unit)),
+         month_to_gib = ifelse(month_to_gib <= 0, NA, month_to_gib),
+         month_to_gib_or_death = ifelse(final_outcome_reason == "expired" | (ever_gib_yes_1_no_0 == 1), pmin(month_to_outcome, month_to_gib, na.rm = T), NA),
+         #DorBorC = ifelse(gib_or_death ==1 | (!is.na(month_to_gib) & month_to_gib >= max_censor), 1, 0),
+         month_to_B_censored = ifelse(!is.na(month_to_gib_or_death) & (month_to_gib_or_death < max_censor), NA, pmin(max_censor, month_to_outcome)),
+         month_to_death_or_censored = ifelse(!is.na(month_to_death), month_to_death, pmin(max_censor, month_to_outcome)),
+         month_to_B_censored = ifelse(!is.na(month_to_gib) & (month_to_gib < max_censor), NA, pmin(month_to_death_or_censored, max_censor)) ) -> ques2
+
+#8ac6a792  d49719ec 2cbe4a5d 40df771d 961c1e2c gib_date before discharge are not considered as outcome
+ques2$month_to_gib[65]
+########
+# sanity check
+#######
+
+ggplot(data.frame(table(ques2$month_to_gib))%>%
+             rename(event_time = Var1, event_count = Freq))+
+  geom_bar(aes(event_time, event_count), stat="identity")+
+  labs(title = "Histogram of GIB/Death occurrence frequence over customed\n censoring-node frame",
+       x = "follow-up time")+
+  my_plot_theme()
+
+#hist(table(ques2$month_to_outcome))
+#table(ques2$month_to_gib_or_death)
+#table(ques2$month_to_DorB_censored)
+
+#sum(!is.na(ques2$month_to_death))
+#sum(!is.na(ques2$month_to_gib_or_death))
+#ques2%>%filter(month_to_gib_or_death <= 0)
+
+ #death as outcome (dropped strategy)
+event<- 
+  ques2%>%
+  select(idx, month_to_censored_d, month_to_death)%>%
+  mutate(nodes = pmin(month_to_censored_d, month_to_death, na.rm = T),
+         nodes = ceiling( nodes/int_tp))
+
+#cat("Death occured time")
+#table(event$month_to_death)
+#
+#timeframe <- expand.grid(idx = event$idx, 
+#                         nodes = 1:((ques2$max_censor)/int_tp)) %>% 
+#  merge.data.frame(event, all.x = T)%>%
+#  mutate(event = month_to_death,
+#         censor = month_to_censored_d)%>%
+#  group_by(idx)%>%
+#  arrange(idx, nodes)%>%
+#  fill(event, censor, .direction = "down")%>%
+#  mutate(event = ifelse(!is.na(event), 1, 0),
+#         censor = ifelse(!is.na(censor) & event == 0, 1, 0 ))
+
+###########
+###########
+event2nd <- 
+  ques2%>%
+  select(id, idx, month_to_B_censored, month_to_gib)%>%
+  mutate(nodes = pmin(month_to_B_censored, month_to_gib, na.rm = T),
+         nodes = abs(ceiling( nodes/int_tp)))%>%
+  mutate(month_to_B_censored = abs(month_to_B_censored),
+         month_to_gib = abs(month_to_gib)) %>% #### temporary fix #####
+  filter(nodes > 0)
+
+
+timeframe <- expand.grid(idx = event2nd$idx, 
+                        nodes = 1:((ques2$max_censor)/int_tp)) %>% 
+ merge.data.frame(event2nd, all.x = T)%>%
+ mutate(event = month_to_gib,
+        censor = month_to_B_censored)%>%
+ group_by(idx)%>%
+ arrange(idx, nodes)%>%
+ fill(event, censor, .direction = "down")%>%
+ mutate(event = ifelse(!is.na(event), 1, 0),
+        censor = ifelse(!is.na(censor) & event == 0, 1, 0 ))
+
+
+ques2$month_to_gib_or_death
+ques2$month_to_gib
+unique(ques1$final_outcome_reason)
+table(event2nd$month_to_gib)
+table(event$month_to_death)
+table(!is.na(event2nd$month_to_gib), is.na(event$month_to_death))
+```
+
+
+## Baseline coveriates    
+Total of 32 baseline coveriates are included, summaried in the table.      
+```{r, class.output="scroll", message=F, warning=F, echo=F, results="hide"}
+
+W <- ques1[, c(4:7, 9, 10, 11:19, 25, 31:34, 38:46, 50:57)] %>% 
+  mutate_if(is.character, as.factor)
+
+W %>%
+  mutate(sex_m_male = factor(ifelse(sex_m_male %in% c("f", "female"), "f", "m")),
+         strategy = factor(ifelse(strategy != "dt", "other", "dt")),
+         race = factor(ifelse(race != "afam", "other", "afam")))%>%
+  select(-implant_date, -device_type, -dialysis_pre_vad_1_yes_0_no,  -x1st_device_exchange) -> W  ### needs to decide Var with multi categories
+W <- complete(mice(W, seed = 11))
+W$albumin_g_d_l  <- as.numeric(W$albumin_g_d_l)
+W$tbili  <- as.numeric(W$tbili)
+W$total_los_includes  <- as.numeric(W$total_los_includes)
+
+```
+
+```{r, class.output="scroll", message=F, warning=F, echo=F}
+W %>% select_if(is.factor) %>% summary() %>% kableExtra::kable()
+W %>% select_if(is.numeric) %>% summary() %>% kableExtra::kable()
+```
+
+
+## Time-varing coveriates 
+* Align lab data with medication data to unified timeframe and intervals.      
+All lab data is aligned with medication data by date of follow-up visit. Unavailable data in either medication data or lab data was filled with the nearest previous data available on record.        
+
+```{r, message=F, class.output="scroll", message=F, warning=F, echo=F}
+ques2 %>%
+  select(id, idx, discharge_date) %>%
+  merge.data.frame(med1, by = "id")%>%
+  merge.data.frame(lab1, by.x = c("id", "visit_date"), by.y = c("id", "ideal_date_labs"),
+                   all.x = T, all.y = T)%>%     # join observed med, lab, with baseline table require the discharge date
+  group_by(id) %>%
+  arrange(id, visit_date) %>%
+  fill(-id, .direction = "down") %>% # unobserved info if filled by last visit 
+  unique()%>%
+  merge.data.frame(med1 %>% select(id, visit_date), by = c("id", "visit_date"), all.y = T)%>%
+  group_by(id) %>%
+  arrange(id, visit_date) %>%
+  mutate(med_date_update = visit_date, # lag(visit_date, default = unique(discharge_date)), no use for now   
+         days_to_visit = as.numeric(difftime(visit_date, discharge_date)),
+         month_to_visit = ceiling(days_to_visit/unit),
+         visits_int = (days_to_visit - lag(days_to_visit, default = 0))/unit)%>%
+  filter(month_to_visit <= min(max_censor, max(ques2$max_censor)))-> med2
+
+med2%>%
+  #mutate_if(is.numeric, funs(replace_na(., 0)))
+  mutate_if(is.character, as.numeric)%>% 
+  mutate(i_aspirin = aspirin * visits_int,  # cumulated binary med
+         i_dipyridamole = dipyridamole * visits_int,
+         i_bb = bb_y_n * visits_int,
+         i_ace = ace_y_n * visits_int,
+         i_arb = arb_y_n * visits_int,
+         i_ccb = ccb_y_n * visits_int,
+         i_aldo = aldo_b_y_n * visits_int,
+         i_pde5i = pde5i_y_n * visits_int,
+         i_loop_d = loop_d_y_n * visits_int,
+         i_thiaz_d = thiaz_d_y_n * visits_int,
+         i_statin = statin_y_n * visits_int,
+         i_amiodarone = amiodarone_y_n * visits_int,
+         i_digoxin = digoxin_y_n * visits_int,
+         i_hydralazine = hydralazine * visits_int,
+         i_ace_arb = ifelse(!is.na(ace_y_n) | !is.na(arb_y_n), 1, NA),
+         i_ace_arb = i_ace_arb * visits_int,
+         ## cumumlated dose
+         d_aspirin = i_aspirin,
+         d_dipyridamole = i_dipyridamole,
+         d_bb = i_bb * bb_dosage,
+         d_ace = ifelse(!is.na(i_ace), i_ace * ace_dosage, 0),
+         d_arb = ifelse(!is.na(i_arb), i_arb * arb_dosage, 0),
+         d_ccb = i_ccb * ccb_dosage ,
+         d_aldo = i_aldo * aldo_b_dosage ,
+         d_pde5i = i_pde5i * pde5i_dosage ,
+         d_loop_d = i_loop_d * loop_d_dosage ,
+         d_thiaz_d = i_thiaz_d * thiaz_d_dosage ,
+         d_statin = i_statin * statin_dosage ,
+         d_amiodarone = i_amiodarone * amiodarone_dosage ,
+         d_digoxin = i_digoxin * digoxin_dosage ,
+         d_hydralazine = i_hydralazine * hydralazine,
+         d_ace_arb = sum(d_ace + d_arb), 
+         nodes = ceiling(month_to_visit / int_tp))-> med3
+
+#colnames(med3)
+#med3%>%kableExtra::kable()%>%kableExtra::kable_styling()%>%kableExtra::scroll_box(height = "200px")
+### Raw data with issue: discharge > visit date:    
+#med3%>%
+#  filter(nodes==0)%>%
+#  kableExtra::kable()%>%kableExtra::kable_styling()%>%kableExtra::scroll_box(height = "200px")
+#
+
+# cumulated drug used either by binary or by incoperate dose  
+#unite is by day
+#colnames(med3)
+Med <- med3[, c(3, 60:90 )]%>%
+  filter(nodes > 0) %>%   
+  merge.data.frame(timeframe %>% select(idx, nodes), by = c("idx", "nodes"), all.y = T)%>%  # merge with final timeframe 
+  group_by(idx, nodes)%>%
+  arrange(idx, nodes)%>%
+  summarise_all(sum) 
+
+```
+* Caculation of cummulated medication usage.     
+Cumulated medicine usage duration is calculate by days then summed up within each desired node interval, avaliable dosage data is in cooperated as multiplier to medication usage.    
+
+Summary of Cumulated medication usage with dosage infomation of all possible treatment options by nodes.    
+
+```{r, echo=F, class.output="scroll", message=F, warning=F}
+by(data.frame(Med[, c(2, 18:32)]), data.frame(Med[, c(2, 18:32)])$nodes, summary)
+```
+
+
+## Create treatment variable.    
+For each node interval, if the cumulative time of medicine usage is >0 , the patient is considered as on treatment for that node, otherwise as not on treatment.     
+
+Summary of all possible treatment options by nodes.      
+```{r, message=F, warning=F, class.output="scroll", echo=F}
+A <- med3[, c(3, 90, grep("^i_", colnames(med3)))]%>%
+  merge.data.frame(timeframe %>% select(idx, nodes), by = c("idx", "nodes"), all.y = T)%>%
+  group_by(idx, nodes)%>%
+  summarise_all(sum)%>%
+  group_by(idx, nodes)%>% # set key wont be convert
+  mutate_all(funs(ifelse(!is.na(.) & . > 0, 1, 0)))%>% # if ever prescribed as Yes pair with dose data
+  #mutate_all(funs(ifelse(!is.na(.) & . > 0.5*int_tp, 1, 0)))%>% # med prescription > 0 as Yes, L matrix will use cumulated incoperate duration
+  group_by(idx)%>%
+  arrange(nodes)%>%
+  mutate(nodes = lag(nodes, default = 0)) %>%
+  filter((nodes!=max(event2nd$nodes)))%>%
+  arrange(idx)
+
+by(data.frame(A[, -1]), data.frame(A[, -1])$nodes, summary)
+```
+
+## Summary of Lab data by nodes.    
+```{r, class.output="scroll", message=F, warning=F, echo=F}
+Lab<- med3[, c(3, 90, 49:55)]%>%
+  merge.data.frame(timeframe %>% select(idx, nodes), by = c("idx", "nodes"), all.y = T)%>%
+  group_by(idx, nodes)%>%
+  arrange(idx, nodes)%>%
+  #fill(everything(), .direction = "up")%>%
+  fill(-idx, -nodes, .direction = "down")%>%
+  mutate(lastlab = 1:n())%>%
+  filter(lastlab == max(lastlab))%>%
+  select(-lastlab) 
+  
+by(data.frame(Lab[, -1]), data.frame(Lab[, -1])$nodes, summary)
+
+ncol(Lab)
+#summary(Lab)
+#A%>%kableExtra::kable()%>%kableExtra::kable_styling()%>%kableExtra::scroll_box(height = "200px")
+#Lab%>%kableExtra::kable()%>%kableExtra::kable_styling()%>%kableExtra::scroll_box(height = "200px")
+```
+
+## Data visualization 
+* Example dynamic treatment regimes for treatment of interest (requires to change max_censoring, int_tp)     
+
+```{r, warning=F, message=F, eval=F, echo=F}
+event %>% 
+  merge.data.frame(A[, c("idx", "nodes", med_to_check)], by = c("idx", "nodes"), all = T) %>%
+  group_by(idx)%>%
+  arrange(idx, nodes)%>%
+  fill(everything(), .direction = "down")%>%
+  mutate(censored_death = lag(ifelse(!is.na(month_to_censored_d)|!is.na(month_to_death), 1, NA)),
+         Event_circle = ifelse(!is.na(month_to_death), nodes, NA))%>%
+  filter(is.na(censored_death))%>%
+  ggplot(aes(nodes, idx, group=idx, col=factor(get(med_to_check)))) +
+  geom_line(size=.4) +
+  geom_point(shape=15, size= 1) +
+  geom_point(aes(Event_circle), col="black", shape=4, size=2) +
+  theme_classic() + 
+  scale_x_continuous(expand=c(0,0)) +
+  scale_y_continuous(expand=c(0.01,0.01)) +
+  labs(x="Months since Discharge", y="Patient ID", col=col_text, title=title_text, subtitle = sub_text) +
+  scale_color_manual(labels=c("No","Yes"), values=c("#FFC72C","#B31B1B")) +
+  theme(legend.position = c(0.9, .7),text=element_text(size=10),
+        legend.box.background = element_rect(color = "black"),
+        legend.background = element_blank())
+```
+
+```{r, message=F, warning=F, echo=F, fig.align="center", fig.width=7, fig.height=7}
+col_text <- paste0(med_to_check, " Prescription")
+title_text <- paste0(med_to_check, " Treatment Timeline")
+sub_text <- "Event: Death or GIB"
+#png.title <- paste0(title_text, ".png")
+#png(png.title)
+p1 <- event2nd %>% 
+  merge.data.frame(A[, c("idx", "nodes", med_to_check)], by = c("idx", "nodes"), all = T) %>%
+  group_by(idx)%>%
+  arrange(idx, nodes)%>%
+  fill(-idx, .direction = "down")%>%
+  mutate(censored_death = lag(ifelse(!is.na(month_to_B_censored)|!is.na(month_to_gib), 1, NA)),
+         Event_circle = ifelse(!is.na(month_to_gib), nodes, NA))%>%
+  filter(is.na(censored_death))%>%
+  ggplot(aes(nodes, idx, group=idx, col=factor(get(med_to_check)))) +
+  geom_line(size=.4) +
+  geom_point(shape=15, size= 1) +
+  geom_point(aes(Event_circle), col="black", shape=4, size=2) +
+  theme_classic() + 
+  scale_x_continuous(expand=c(0,0.1), breaks = seq(0, max_censor/int_tp), labels = seq(0, max_censor, by = int_tp)) +
+  scale_y_continuous(expand=c(0.01,0.01)) +
+  labs(x="Months since Discharge", y="Patient ID", col=col_text, title=title_text, subtitle = sub_text) +
+  scale_color_manual(labels=c("No","Yes"), values=c("#FFC72C","#B31B1B")) +
+  theme(legend.position = "bottom",text=element_text(size=10),
+        legend.box.background = element_rect(color = "black"),
+        legend.background = element_blank(),
+        plot.title = element_text(hjust = 0.5))
+p1 
+#pdf(paste0("./", title_text, "_max_censoring_", max_censor, "_at_", int_tp, ".pdf"))
+#p1
+#dev.off()
+```
+
+* Survival curve of Digoxin and Ace_or_Arb by ever on treatment.    
+  
+```{r, message=F, warning=F, echo=F, fig.align="center", fig.width=7, fig.height=7}
+surv_plot <- 
+  expand.grid(id = ques2$id, 
+            month_to_visit = 1:(max(ques2$month_to_outcome))) %>% 
+  merge.data.frame(ques2 %>%
+                     select(id, month_to_outcome, month_to_gib), all.x = T)%>%
+  group_by(id)%>%
+  arrange(id, month_to_visit)%>%
+  filter(month_to_visit <= month_to_outcome)%>%
+  mutate(ever_event = ifelse(!is.na(month_to_gib), 1, 0))
+
+
+surv_dat <- surv_plot %>%
+  merge.data.frame(med2%>%
+       select(id, digoxin_y_n, arb_y_n, ace_y_n, month_to_visit)%>%
+       mutate_if(is.character, as.numeric)%>%
+       mutate(digoxin = ifelse(is.na(digoxin_y_n), "Never", "Yes"),
+              ace_arb = ifelse((is.na(arb_y_n) & is.na(ace_y_n)), "Never", "Yes")))
+diox <- survfit(Surv(month_to_outcome, ever_event) ~ digoxin, data = surv_dat)
+ace_arb <- survfit(Surv(month_to_outcome, ever_event) ~ ace_arb, data = surv_dat)
+#autoplot(diox)+
+#  +labs(title = "")
+#  my_plot_theme()
+#autoplot(ace_arb)+
+#  +labs(title = "")
+#  my_plot_theme()
+
+fit <- list(Digoxin = diox, Ace_arb = ace_arb)
+ggsurvplot(fit, data = surv_dat, combine = TRUE, censor = T, palette = "jco")
+
+```
+
+# Survival Marginal Structual Model TMLE    
+
+## Prepare final data for TMLE    
+Wrangle final dataset to pass to tmleMSM(). Where $C_t$ is the binary indicator of censoring, $Y_t$ is the binary indicator of outcome, $A_t$ is the binary indicator of treatment exposure of Digoxin, $L_0$ is the baseline covariates and $L_t$ are the laboratory variables and medication data at follow-up visit $t$.         
+```{r, class.output="scroll", echo=F, message=F, warning=F}
+trt.matrix <- A%>%
+  data.frame()%>%
+  select(idx, nodes, med_to_check)%>%
+  reshape(v.names = med_to_check, idvar = "idx", timevar = "nodes", direction = "wide")%>%
+  mutate_all(list(~replace_na(.,0))) 
+colnames(trt.matrix) <- c("PatientID", paste("A_", c(0: (max(event2nd$nodes)-1)), "_", sep = ""))
+
+
+
+L <- merge.data.frame(Med, Lab)
+#summary(L)
+#colnames(L)
+#L <- L[, -c(grep("^i_", colnames(L)))]
+L <- L[, -c(grep("^i_", colnames(L)))]
+#L <- L[, c(!is.element(colnames(L), gsub("^i_", "d_", med_to_check)))]
+
+Lnode.list <- list()
+for (Var in 3:ncol(L)) {
+  i <- colnames(L)[Var]
+  Lnode.list[[i]]<- 
+    data.frame(L[, c("idx", "nodes", i)])%>%
+    reshape(v.names = i, idvar = "idx", timevar = "nodes", direction = "wide")%>%
+    mutate_all(list(~replace_na(.,0)))
+  colnames(Lnode.list[[i]]) <- c("PatientID", paste(paste0("L_", Var), 1:max(event2nd$nodes), "_", sep = "_"))
+  Lnode.list[[i]] <- Lnode.list[[i]][,-1]
+}
+L.matrix <- do.call(cbind, Lnode.list)
+colnames(L.matrix) <- gsub("^.*L", "L", colnames(L.matrix), perl = T)
+L.matrix$PatientID <- trt.matrix$PatientID
+
+c.matrix <- timeframe%>%
+  data.frame()%>% 
+  dplyr::select(idx, nodes, censor)%>%
+  reshape(v.names = "censor", idvar = "idx", timevar = "nodes", direction = "wide")
+colnames(c.matrix) <- c("PatientID", paste("C_", 1:max(event2nd$nodes), "_", sep = ""))
+
+
+y.matrix <- timeframe %>%
+  dplyr::select(idx, nodes, event)%>%
+  data.frame()%>%
+  reshape(v.names = "event", idvar = "idx", timevar = "nodes", direction = "wide")%>%
+  mutate_all(funs(ifelse(is.na(.), 0, .)))
+colnames(y.matrix) <- c("PatientID", paste("Y_", 1:max(event2nd$nodes), "_", sep = ""))
+
+#lapply(2:(ncol(y.matrix)-1), function(x) table(trt.matrix[,x], y.matrix[,x]))
+```
+
+
+```{r}
+hm <- L %>%
+  filter(idx %in% c(73, 5, 3)) 
+col_anno <- data.frame(patientID = factor(hm$idx),
+                       Digoxin = ifelse(is.na(hm$d_digoxin), "no", "yes"))
+hm1 <- t(as.matrix(hm[, 3: ncol(hm)]))
+#####change
+rownames(col_anno) <- colnames(hm1) <- 1:ncol(hm1)
+
+pheatmap::pheatmap(hm1, scale = "row", cluster_rows = F, cluster_cols = F, annotation_col = col_anno, na_col = "white", show_colnames = F, gaps_col = c(max(hm$nodes), max(hm$nodes)*2))
+
+```
+
+
+```{r, eval=F, echo=F}
+##################
+##################
+invisible(lapply(2:(ncol(y.matrix)), function(x) {
+  cat("node", x-1, "censoring(row) : event", sep = " ")
+  print(table(c.matrix[,x], y.matrix[,x]))
+  cat("\n")
+}))
+#cat("final node censoring count:", sum(c.matrix[,ncol(c.matrix)]), "\n")
+#cat("final node event count:", sum(y.matrix[,ncol(y.matrix)]))
+
+invisible(lapply(2:(ncol(y.matrix)-1), function(x) {
+  cat("node", x-1, "treatment(row) : event", sep = " ")
+  print(table(trt.matrix[,x+1], y.matrix[,x]))
+  cat("\n")
+}))
+
+invisible(lapply(2:(ncol(y.matrix)-1), function(x) {
+  cat("node", x-1, "treatment(row) : censoring", sep = " ")
+  print(table(trt.matrix[,x+1], c.matrix[,x]))
+  cat("\n")
+}))
+
+```
+ 
+
+```{r, class.output="scroll", message=F, warning=F, echo=F}
+CLAY <- merge.data.frame(c.matrix, L.matrix, by = "PatientID")%>%
+  merge.data.frame(trt.matrix, by = "PatientID")%>%
+  merge.data.frame(y.matrix, by = "PatientID")
+
+#CLAY <- merge.data.frame(c.matrix, trt.matrix, by = "PatientID")%>% merge.data.frame(y.matrix, by = "PatientID")
+
+Temp.CLAY <- CLAY[, c(1, grep("*_0_", colnames(CLAY)))]
+
+for (i in 1 : (ncol(y.matrix)-1)) {
+  pat <- paste(".*_", i, "_", sep = "")
+  Temp.CLAY <- cbind.data.frame(Temp.CLAY, CLAY[, c(grep(pattern = pat, colnames(CLAY)))])
+}
+
+finaldf <- W%>%
+  merge.data.frame(Temp.CLAY, by.x = "idx", by.y = "PatientID")%>%
+  dplyr::select(-idx)
+
+for (i in grep("C_*_", names(finaldf))) {
+  finaldf[, i] <- factor(finaldf[, i], levels = c(0,1), labels = c("uncensored", "censored"))
+}
+
+write_delim(finaldf, paste0("./", title_text, "_max_censoring_", max_censor, "_at_", int_tp, ".txt"))
+#finaldf <- data.frame(read.delim("~/Desktop/HMIII/CLAY_ace_diox_max_censor27_3M.txt", sep = " "))
+#summary(finaldf)
+#finaldf%>%kableExtra::kable()%>%kableExtra::kable_styling()%>%kableExtra::scroll_box(height = "200px")
+```
+
+## Survival Marginal Structual Model:    
+$\lambda_{T_\overline{a}}(t|L)=\lambda_0(t)exp(\beta_1a(t)+\beta_2Cum.a)$    
+where $\lambda_0(t)$ is the unspecified baseline hazard, $\lambda_{T_\overline{a}}(t|L)$ is the hazard of adverse event at time $t$ among subjects followed treatment history $\overline{a}$ through time $t$. The parameter $\beta_1$ is the causal hazard log ratio of Digoxin at time $t$ under dynamic treatment regimes. $\beta_2$ is the causal hazard log ratio of the cumulative Digoxin treatment time $Cum.a$, which is the summarized variable of the empirical treatment regimens observed in the dataset.    
+
+```{r, class.output="scroll", eval=F, echo=F}
+num.nodes <- ncol(trt.matrix)-1
+
+# empirical regimes
+#Regimes.design <- as.matrix(unique(trt.matrix[,-1]))
+Regimes.design <- as.matrix(finaldf[, grep("A_*", colnames(finaldf))])
+
+#library(gtools)
+#Regimes.design <- permutations(n = 2, r = num.nodes, v= c(1, 0), repeats.allowed = T)
+
+colnames(Regimes.design) <- paste("TimeNode", 0: (ncol(Regimes.design)-1), sep = "")
+
+num.of.Regimes <- nrow(Regimes.design)
+num.pt <- nrow(y.matrix)
+
+regimesList <- array(NA, dim = c(num.pt, num.nodes, num.of.Regimes))
+for (i in 1 : num.pt) {
+  regimesList[i, , ] <- Regimes.design
+}
+
+
+num.ynodes <- ncol(y.matrix)-1
+Summary.Measures <- array(NA, dim = c(num.of.Regimes, 2, num.ynodes))
+Summary.Measures[, , 1] <- cbind(Regimes.design[, 1], rep(1, num.of.Regimes))
+for (i in 2 : num.ynodes) {
+  time <- c(1:num.ynodes)[i]
+  temp.A <- rowSums(Regimes.design[, 1:i])
+  Summary.Measures[, , i] <- cbind(temp.A, rep(time, num.of.Regimes))
+}
+
+dimnames(Summary.Measures)[[2]] <- c("cum.A", "time")
+
+```
+
+## Superlearner algorithm library    
+```{r, class.output="scroll", eval=F}
+SL.caretRF <- function(Y, X, newX, family, obsWeights, ...) {
+  SL.caret(Y, X, newX, family, obsWeights, method = "rf",  tuneLength = 10,
+           trControl =  caret::trainControl(method = "cv", number = 3, search = "random",
+                                            verboseIter = TRUE), ...)
+}
+SL.caretXGB <- function(Y, X, newX, family, obsWeights, ...) {
+  SL.caret(Y, X, newX, family, obsWeights, method = "xgbTree", tuneLength = 10,
+           trControl =  caret::trainControl(method = "cv", number = 3, search = "random",
+                                            verboseIter = TRUE), ...)
+}
+
+
+SL.glmboost <- function(Y, X, newX, family, obsWeights, ...) {
+  SL.caret(Y, X, newX, family, obsWeights, method = "glmboost", tuneLength = 10, 
+           trControl =  caret::trainControl(method = "cv", number = 3, search = "random",
+                                            verboseIter = TRUE), ...)
+}
+
+SL.mlp <- function(Y, X, newX, family, obsWeights, ...) {
+  SL.caret(Y, X, newX, family, obsWeights, method = "mlp", tuneLength = 5, 
+           trControl =  caret::trainControl(method = "cv", number = 3, search = "random",
+                                            verboseIter = TRUE), ...)
+}
+
+SL.knn <- function(Y, X, newX, family, obsWeights, ...) {
+  SL.caret(Y, X, newX, family, obsWeights, method = "kknn", tuneLength = 10, 
+           preProc = c("center", "scale"),
+           trControl =  caret::trainControl(method = "cv", number = 3, search = "random",
+                                            verboseIter = TRUE), ...)
+}
+
+```
+
+## TMLE implementation 
+```{r, class.output="scroll", warning=F, message=F, eval=F}
+library(ltmle)
+library(SuperLearner)
+
+result.regList <- ltmleMSM(finaldf, 
+                           Anodes= grep("A_*_", names(finaldf)), 
+                           Cnodes= grep("C_*_", names(finaldf)), 
+                           Ynodes= grep("Y_*_", names(finaldf)),
+                           Lnodes= grep("L_.*", names(finaldf)),
+                           survivalOutcome=TRUE, 
+                           regimes=regimesList,
+                           summary.measures=Summary.Measures, 
+                           variance.method = "ic", 
+                           final.Ynodes= grep("Y_*", names(finaldf)),
+                           SL.library = list("SL.mlp", "SL.glm", "SL.caretRF", "SL.caretXGB", "SL.glmboost", "SL.knn"),
+                           SL.cvControl = list(V = 2, stratifyCV = F),
+                           working.msm="Y ~ (time + cum.A)",
+                           iptw.only = F, 
+                           gcomp = F,
+                           msm.weights = NULL, 
+                           estimate.time=FALSE)
+
+cat("IPTW\n")
+result.regList$beta.iptw
+cat("LTMLE\n")
+summary(result.regList)
+result.regList$fit$g[[1]]
+summary(result.regList)[[1]][3, ]
+
+save(result.regList, file = "pde5i_12_3_B_tmle.RData")
+```
+
+```{r, echo=F}
+sessionInfo()
+```
+
+
+
+
+
