@@ -419,7 +419,7 @@ tableW <- W[, -33]
 tableW$trt <- diox
 colnames(tableW) <- toupper(colnames(tableW))
 
-tbl_summary(tableW, by = TRT)%>%
+gtsummary::tbl_summary(tableW, by = TRT)%>%
   bold_labels()%>%
   as_gt()
 ```
@@ -456,7 +456,7 @@ tbl_summary(tableLall, by = TRT, type = list(all_numeric() ~ "continuous"), digi
   as_gt()
 ```
 
-### Unadjusted Cox proportional hazards model      
+    
 ```{r, message=F, warning=F, echo=F, fig.align="center", fig.width=7, fig.height=6, results="hide"}
 surv_dat <- 
   expand.grid(id = event2nd$id, 
@@ -510,23 +510,31 @@ summary(fit_td)
 ```
 
 
-The unadjusted HR of Digoxin was `r round(summary(fit)$coefficients[2], 2)` (95% CI: `r round(summary(fit)$conf.int[3], 2)` - `r round(summary(fit)$conf.int[4], 2)`).
+### Unadjusted Cox proportional hazards model     
+The unadjusted HR of Digoxin was `r round(summary(fit)$coefficients[2], 2)` (95% CI: `r round(summary(fit)$conf.int[3], 2)` - `r round(summary(fit)$conf.int[4], 2)`).    
 
-### The covariate-adjusted time-dependent Cox proportional hazards model   
+
+### The time-varing Cox proportional hazards model   
+
+The HR of time-varing Cox PH model was `r round(summary(fit_td)$coefficients[2], 2)` (95% CI: `r round(summary(fit_td)$conf.int[3], 2)` - `r round(summary(fit_td)$conf.int[4], 2)`).    
+
+
+### marginal structural model    
 ```{r, echo=F}
 load("../data/18M_3I_ic_diox.RData")
 #summary(result.regList)
 cuma <- summary(result.regList)$cmat["cum.A",]
 ```
 
-The time-dependent covariate-adjusted HR of Digoxin was `r round(exp(cuma[1]), 2)` (95% CI: `r round(exp(cuma[3]), 2)` - `r round(exp(cuma[4]), 2)`).
+The HR of marginal structural model was `r round(exp(cuma[1]), 2)` (95% CI: `r round(exp(cuma[3]), 2)` - `r round(exp(cuma[4]), 2)`).
 
 ### HR Summary Table    
 
 |               |      Hazards Ratio                          |       95% CI                                                                  | p-Value                                                 |   
 |---------------|---------------------------------------------|-------------------------------------------------------------------------------|---------------------------------------------------------|
 | Unadjusted    | `r round(summary(fit)$coefficients[2], 2)`  | `r round(summary(fit)$conf.int[3], 2)`-`r round(summary(fit)$conf.int[4], 2)` |   `r round(summary(fit)$waldtest[3], 2)`  |
-| Adjusted      | `r round(exp(cuma[1]), 2)`                  | `r round(exp(cuma[3]), 2)`-`r round(exp(cuma[4]), 2)`                         |   `r round(cuma[5], 2)`                                  |
+| Time-Varing Cox-PH     | `r round(summary(fit_td)$coefficients[2], 2)`  | `r round(summary(fit_td)$conf.int[3], 2)`-`r round(summary(fit_td)$conf.int[4], 2)` |   `r round(summary(fit_td)$waldtest[3], 2)`  |
+| Marginal Structural Model      | `r round(exp(cuma[1]), 2)`                  | `r round(exp(cuma[3]), 2)`-`r round(exp(cuma[4]), 2)`                         |   `r round(cuma[5], 2)`                                  |
 
 
 
@@ -648,60 +656,91 @@ tbl_summary(tableLall, by = TRT, type = list(all_numeric() ~ "continuous"), digi
   as_gt()
 ```
 
-### Unadjusted Cox proportional hazards model      
+
 ```{r, message=F, warning=F, echo=F, fig.align="center", fig.width=7, fig.height=6, results="hide"}
 surv_dat <- 
   expand.grid(id = event2nd$id, 
-            nodes = 1:(max(event2nd$nodes))) %>% 
+            nodes = 1:(max(ques2$month_to_outcome)/int_tp)) %>% 
   merge.data.frame(ques2 %>%
                      select(id, month_to_outcome, month_to_gib_or_death, idx)%>%
-                     mutate(month_to_outcome = ceiling(month_to_outcome / int_tp)), all.x = T)%>%
+                     mutate(month_to_outcome = pmin(ceiling(month_to_outcome / int_tp), max(event2nd$nodes)),
+                            month_to_gib_or_death = ifelse(!is.na(month_to_gib_or_death),
+                                                           pmin(ceiling(month_to_gib_or_death/int_tp), max(event2nd$nodes)), NA)),
+                   all.x = T)%>%
+  filter(nodes <= month_to_outcome)%>%
   group_by(id)%>%
   arrange(id, nodes)%>%
-  filter(nodes <= max(event2nd$nodes))%>%
   fill(month_to_gib_or_death, .direction = "down")%>%
   mutate(ever_event = ifelse(!is.na(month_to_gib_or_death), 1, 0))%>%
-  merge.data.frame(A%>%select(idx, i_ace_arb) %>%  #---------change ---------------  i_ace_arb   i_digoxin
+  merge.data.frame(med3%>%select(idx, d_ace_arb) %>%  #---------change ---------------  i_ace_arb   i_digoxin
                      group_by(idx) %>%
-                     summarize(Ace_or_Arb = ifelse(sum(i_ace_arb) != 0, "Yes", "Never"))%>%
-                     data.frame(), all.x = T, by = "idx")%>% #---------change ---------------  i_ace_arb   i_digoxin
-  select(-idx, -id, -nodes, -month_to_gib_or_death)
+                     summarize(Ace_or_Arb = ifelse(sum(d_ace_arb, na.rm = T) != 0, "Yes", "Never"))%>%
+                     data.frame(), all.x = T, by = "idx")%>%
+  merge.data.frame(med3%>%select(idx, nodes, d_ace_arb) %>% 
+                     group_by(idx, nodes)%>%
+                     summarise(d_ace_arb = sum(d_ace_arb, na.rm = T)), all.x = T)%>%
+  mutate(d_ace_arb = replace_na(d_ace_arb, 0),
+         nodes_bl = nodes - 1,
+         status = ifelse(!is.na(month_to_gib_or_death)& month_to_gib_or_death > nodes_bl & month_to_gib_or_death <= nodes, 1, 0))
 
 
-colnames(A)
-head(surv_dat)
-
-fit <- survfit(Surv(month_to_outcome, ever_event) ~ Ace_or_Arb, data = surv_dat)
-ggsurvplot(fit, data = surv_dat, censor = T, palette = "jco", pval = F, pval.coord = c(12, 0.85))
+fit <- survfit(Surv(month_to_outcome, ever_event) ~ Ace_or_Arb, data = surv_dat%>%
+                         select(idx, month_to_outcome, ever_event, Ace_or_Arb)%>%
+                         unique())
+ggsurvplot(fit, data = surv_dat, censor = T, palette = "jco", pval = F, pval.coord = c(12, 0.8))
 #ace_arb <- survfit(Surv(month_to_outcome, ever_event) ~ ace_arb, data = surv_dat)
 
-fit <- survival::coxph(Surv(month_to_outcome, ever_event) ~ Ace_or_Arb, data = surv_dat)
+fit <- survival::coxph(Surv(month_to_outcome, ever_event) ~ Ace_or_Arb,
+                       data = surv_dat%>%
+                         select(idx, month_to_outcome, ever_event, Ace_or_Arb)%>%
+                         unique())
+
+fit_td <- survival::coxph(Surv(nodes_bl, nodes, status) ~ d_ace_arb, 
+                          data = surv_dat%>%
+                            select(idx, nodes_bl, nodes, status, d_ace_arb, month_to_gib_or_death, month_to_outcome)%>%
+                            mutate(month_to_gib_or_death = ifelse(is.na(month_to_gib_or_death),
+                                                                  month_to_outcome, month_to_gib_or_death),
+                                   d_ace_arb = ifelse(d_ace_arb != 0, 1, 0))%>%
+                            filter(nodes <= month_to_gib_or_death))
 ```
 
 ```{r, echo=F, eval=F}
 summary(fit)
+summary(fit_td)
 ```
 
+### Unadjusted Cox proportional hazards model      
 
 The unadjusted HR of Ace/Arb was `r round(summary(fit)$coefficients[2], 2)` (95% CI: `r round(summary(fit)$conf.int[3], 2)` - `r round(summary(fit)$conf.int[4], 2)`).
 
-### The covariate-adjusted time-dependent Cox proportional hazards model   
+### The time-varing Cox proportional hazards model   
+
+The HR of time-varing Cox PH model was `r round(summary(fit_td)$coefficients[2], 2)` (95% CI: `r round(summary(fit_td)$conf.int[3], 2)` - `r round(summary(fit_td)$conf.int[4], 2)`).   
+
+### marginal structural model  
 ```{r, echo=F}
 load("../data/18M_3I_ic_ace_arb.RData")
 #summary(result.regList)
 cuma <- summary(result.regList)$cmat["cum.A",]
 ```
 
-The time-dependent covariate-adjusted HR of Ace/Arb was `r round(exp(cuma[1]), 2)` (95% CI: `r round(exp(cuma[3]), 2)` - `r round(exp(cuma[4]), 2)`).
+The HR of marginal structural model was `r round(exp(cuma[1]), 2)` (95% CI: `r round(exp(cuma[3]), 2)` - `r round(exp(cuma[4]), 2)`).
 
 ### HR Summary Table    
 
 |               |      Hazards Ratio                          |       95% CI                                                                  | p-Value                                                 |   
 |---------------|---------------------------------------------|-------------------------------------------------------------------------------|---------------------------------------------------------|
 | Unadjusted    | `r round(summary(fit)$coefficients[2], 2)`  | `r round(summary(fit)$conf.int[3], 2)`-`r round(summary(fit)$conf.int[4], 2)` |   `r round(summary(fit)$waldtest[3], 2)`  |
-| Adjusted      | `r round(exp(cuma[1]), 2)`                  | `r round(exp(cuma[3]), 2)`-`r round(exp(cuma[4]), 2)`                         |   `r ifelse(round(cuma[5], 2) < 0.01, "<0.01", round(cuma[5], 2))`                                  |
+| Time-Varing Cox-PH     | `r round(summary(fit_td)$coefficients[2], 2)`  | `r round(summary(fit_td)$conf.int[3], 2)`-`r round(summary(fit_td)$conf.int[4], 2)` |   `r round(summary(fit_td)$waldtest[3], 2)`  |
+| Marginal Structural Model      | `r round(exp(cuma[1]), 2)`                  | `r round(exp(cuma[3]), 2)`-`r round(exp(cuma[4]), 2)`                         |   `r round(cuma[5], 2)`                                  |
+          |
 
 ## Pde5i 18-month censoring / 3-month node    
+
+```{r, echo=F}
+#i_ace_arb , i_digoxin, i_aspirin
+med_to_check  <- "i_pde5i"
+```
 
 ### pde5i Treatment Timeline    
 ```{r, message=F, warning=F, echo=F, fig.width=7, fig.height=6, fig.align="center"}
@@ -814,59 +853,83 @@ tbl_summary(tableLall, by = TRT, type = list(all_numeric() ~ "continuous"), digi
   as_gt()
 ```
 
-### Unadjusted Cox proportional hazards model      
+
 ```{r, message=F, warning=F, echo=F, fig.align="center", fig.width=7, fig.height=6, results="hide"}
 surv_dat <- 
   expand.grid(id = event2nd$id, 
-            nodes = 1:(max(event2nd$nodes))) %>% 
+            nodes = 1:(max(ques2$month_to_outcome)/int_tp)) %>% 
   merge.data.frame(ques2 %>%
                      select(id, month_to_outcome, month_to_gib_or_death, idx)%>%
-                     mutate(month_to_outcome = ceiling(month_to_outcome / int_tp)), all.x = T)%>%
+                     mutate(month_to_outcome = pmin(ceiling(month_to_outcome / int_tp), max(event2nd$nodes)),
+                            month_to_gib_or_death = ifelse(!is.na(month_to_gib_or_death),
+                                                           pmin(ceiling(month_to_gib_or_death/int_tp), max(event2nd$nodes)), NA)),
+                   all.x = T)%>%
+  filter(nodes <= month_to_outcome)%>%
   group_by(id)%>%
   arrange(id, nodes)%>%
-  filter(nodes <= max(event2nd$nodes))%>%
   fill(month_to_gib_or_death, .direction = "down")%>%
   mutate(ever_event = ifelse(!is.na(month_to_gib_or_death), 1, 0))%>%
-  merge.data.frame(A%>%select(idx, i_pde5i) %>%  #---------change ---------------  i_ace_arb   i_digoxin
+  merge.data.frame(med3%>%select(idx, d_pde5i) %>%  #---------change ---------------  i_ace_arb   i_digoxin
                      group_by(idx) %>%
-                     summarize(Pde5i = ifelse(sum(i_pde5i) != 0, "Yes", "Never"))%>%
-                     data.frame(), all.x = T, by = "idx")%>% #---------change ---------------  i_ace_arb   i_digoxin
-  select(-idx, -id, -nodes, -month_to_gib_or_death)
+                     summarize(Pde5i = ifelse(sum(d_pde5i, na.rm = T) != 0, "Yes", "Never"))%>%
+                     data.frame(), all.x = T, by = "idx")%>%
+  merge.data.frame(med3%>%select(idx, nodes, d_pde5i) %>% 
+                     group_by(idx, nodes)%>%
+                     summarise(d_pde5i = sum(d_pde5i, na.rm = T)), all.x = T)%>%
+  mutate(d_pde5i = replace_na(d_pde5i, 0),
+         nodes_bl = nodes - 1,
+         status = ifelse(!is.na(month_to_gib_or_death)& month_to_gib_or_death > nodes_bl & month_to_gib_or_death <= nodes, 1, 0))
 
 
-colnames(A)
-head(surv_dat)
-
-fit <- survfit(Surv(month_to_outcome, ever_event) ~ Pde5i, data = surv_dat)
-ggsurvplot(fit, data = surv_dat, censor = T, palette = "jco", pval = F, pval.coord = c(12, 0.85))
+fit <- survfit(Surv(month_to_outcome, ever_event) ~ Pde5i, data = surv_dat%>%
+                         select(idx, month_to_outcome, ever_event, Pde5i)%>%
+                         unique())
+ggsurvplot(fit, data = surv_dat, censor = T, palette = "jco", pval = F, pval.coord = c(12, 0.8))
 #ace_arb <- survfit(Surv(month_to_outcome, ever_event) ~ ace_arb, data = surv_dat)
 
-fit <- survival::coxph(Surv(month_to_outcome, ever_event) ~ Pde5i, data = surv_dat)
+fit <- survival::coxph(Surv(month_to_outcome, ever_event) ~ Pde5i,
+                       data = surv_dat%>%
+                         select(idx, month_to_outcome, ever_event, Pde5i)%>%
+                         unique())
+
+fit_td <- survival::coxph(Surv(nodes_bl, nodes, status) ~ d_pde5i, 
+                          data = surv_dat%>%
+                            select(idx, nodes_bl, nodes, status, d_pde5i, month_to_gib_or_death, month_to_outcome)%>%
+                            mutate(month_to_gib_or_death = ifelse(is.na(month_to_gib_or_death),
+                                                                  month_to_outcome, month_to_gib_or_death),
+                                   d_pde5i = ifelse(d_pde5i != 0, 1, 0))%>%
+                            filter(nodes <= month_to_gib_or_death))
 ```
 
 ```{r, echo=F, eval=F}
 summary(fit)
+summary(fit_td)
 ```
 
+### Unadjusted Cox proportional hazards model      
 
 The unadjusted HR of Pde5i was `r round(summary(fit)$coefficients[2], 2)` (95% CI: `r round(summary(fit)$conf.int[3], 2)` - `r round(summary(fit)$conf.int[4], 2)`).
 
-### The covariate-adjusted time-dependent Cox proportional hazards model   
+### The time-varing Cox proportional hazards model   
+
+The HR of time-varing Cox PH model was `r round(summary(fit_td)$coefficients[2], 2)` (95% CI: `r round(summary(fit_td)$conf.int[3], 2)` - `r round(summary(fit_td)$conf.int[4], 2)`).   
+
+### marginal structural model  
 ```{r, echo=F}
 load("../data/18M_3I_pde5i_ic.RData")
 #summary(result.regList)
 cuma <- summary(result.regList)$cmat["cum.A",]
 ```
 
-The time-dependent covariate-adjusted HR of Pde5i was `r round(exp(cuma[1]), 2)` (95% CI: `r round(exp(cuma[3]), 2)` - `r round(exp(cuma[4]), 2)`).
+The HR of marginal structural model was `r round(exp(cuma[1]), 2)` (95% CI: `r round(exp(cuma[3]), 2)` - `r round(exp(cuma[4]), 2)`).
 
 ### HR Summary Table    
 
 |               |      Hazards Ratio                          |       95% CI                                                                  | p-Value                                                 |   
 |---------------|---------------------------------------------|-------------------------------------------------------------------------------|---------------------------------------------------------|
 | Unadjusted    | `r round(summary(fit)$coefficients[2], 2)`  | `r round(summary(fit)$conf.int[3], 2)`-`r round(summary(fit)$conf.int[4], 2)` |   `r round(summary(fit)$waldtest[3], 2)`  |
-| Adjusted      | `r round(exp(cuma[1]), 2)`                  | `r round(exp(cuma[3]), 2)`-`r round(exp(cuma[4]), 2)`                         |   `r ifelse(round(cuma[5], 2) < 0.01, "<0.01", round(cuma[5], 2))`  
-
+| Time-Varing Cox-PH     | `r round(summary(fit_td)$coefficients[2], 2)`  | `r round(summary(fit_td)$conf.int[3], 2)`-`r round(summary(fit_td)$conf.int[4], 2)` |   `r round(summary(fit_td)$waldtest[3], 2)`  |
+| Marginal Structural Model      | `r round(exp(cuma[1]), 2)`                  | `r round(exp(cuma[3]), 2)`-`r round(exp(cuma[4]), 2)`                         |   `r round(cuma[5], 2)`                                  |
 
 
 
